@@ -6,8 +6,14 @@ Clients send assistant tool calls with `function.arguments` as a JSON STRING
     {%- for args_name, args_value in tool_call.arguments|items %}
 
 which needs a mapping, so a string raises TypeError inside Jinja and the
-request returns NOTHING -- the client hangs on a spinner. It triggers on every
-agentic turn whose history contains a prior tool call.
+request fails. It triggers on every agentic turn whose history contains a
+prior tool call.
+
+Values that are not mappings after a JSON read (a truncated arguments string,
+a JSON array, null, a bare list) are coerced to one too -- ``{"_raw": ...}``
+keeps the original text visible to the model -- because a client that replays
+its history verbatim would otherwise fail every later request of the session,
+not just the turn that produced the bad call.
 """
 from __future__ import annotations
 
@@ -39,16 +45,43 @@ def test_already_a_dict_is_left_alone():
     assert _normalize_tool_call_arguments(msgs) is msgs
 
 
-def test_unparseable_arguments_are_not_mangled():
-    """Never turn a bad payload into a crash of our own."""
+def test_unparseable_arguments_become_raw_mapping():
+    """A string that is not JSON would crash the template's ``arguments|items``;
+    keep the text where the model can still see it instead of failing the request."""
     out = _normalize_tool_call_arguments([_msg("not json at all")])
-    assert _args(out) == "not json at all"
+    assert _args(out) == {"_raw": "not json at all"}
 
 
-def test_json_that_is_not_an_object_is_left_alone():
+def test_truncated_arguments_become_raw_mapping():
+    # A tool call cut off mid-stream (max tokens, an interrupted stream) and replayed
+    # from a client's history must not 400 every later turn of the session.
+    truncated = '{"command": "curl -sL https://example.com/docs > /tmp/'
+    out = _normalize_tool_call_arguments([_msg(truncated)])
+    assert _args(out) == {"_raw": truncated}
+
+
+def test_json_that_is_not_an_object_becomes_raw_mapping():
     # "[1,2]" parses, but the template needs a mapping, not a list.
     out = _normalize_tool_call_arguments([_msg("[1, 2]")])
-    assert _args(out) == "[1, 2]"
+    assert _args(out) == {"_raw": "[1, 2]"}
+
+
+def test_null_arguments_become_empty_mapping():
+    # ``arguments: null`` is defined and != '', so the template would iterate None.
+    out = _normalize_tool_call_arguments([_msg(None)])
+    assert _args(out) == {}
+
+
+def test_non_string_non_mapping_arguments_become_raw_mapping():
+    out = _normalize_tool_call_arguments([_msg(["a", "b"])])
+    assert _args(out) == {"_raw": ["a", "b"]}
+
+
+def test_coercion_does_not_mutate_the_caller():
+    original = _msg("not json at all")
+    msgs = [original]
+    _normalize_tool_call_arguments(msgs)
+    assert original["tool_calls"][0]["function"]["arguments"] == "not json at all"
 
 
 def test_multiple_tool_calls_all_normalized():

@@ -100,14 +100,24 @@ def _normalize_tool_call_arguments(messages: list[dict[str, Any]]) -> list[dict[
         for call in calls:
             fn = call.get("function") if isinstance(call, dict) else None
             args = fn.get("arguments") if isinstance(fn, dict) else None
+            # Templates iterate arguments|items, so a mapping is required; a truncated or
+            # otherwise malformed arguments value (e.g. a tool call cut off mid-stream and
+            # replayed from a client's history) otherwise 400s every later turn of the
+            # session. Coerce it to a mapping that keeps the raw text visible to the model.
             if isinstance(args, str):
                 try:
                     parsed = json.loads(args)
                 except (ValueError, TypeError):
                     parsed = None
-                if isinstance(parsed, dict):
-                    call = {**call, "function": {**fn, "arguments": parsed}}
-                    touched = True
+                replacement = parsed if isinstance(parsed, dict) else {"_raw": args}
+                call = {**call, "function": {**fn, "arguments": replacement}}
+                touched = True
+            elif args is not None and not isinstance(args, dict):
+                call = {**call, "function": {**fn, "arguments": {"_raw": args}}}
+                touched = True
+            elif args is None and fn is not None and "arguments" in fn:
+                call = {**call, "function": {**fn, "arguments": {}}}
+                touched = True
             new_calls.append(call)
         if touched:
             out.append({**message, "tool_calls": new_calls})
